@@ -1,13 +1,23 @@
 "use client";
 
 import { createClient } from "@/lib/supabase/client";
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { useSearchParams } from "next/navigation";
+import { Suspense } from "react";
 
-export default function LoginPage() {
+function LoginForm() {
   const [email, setEmail] = useState("");
   const [sent, setSent] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
   const supabase = createClient();
+  const searchParams = useSearchParams();
+
+  useEffect(() => {
+    if (searchParams.get("error") === "auth_failed") {
+      setError("Link expired or invalid. Please try again.");
+    }
+  }, [searchParams]);
 
   const loginWithGoogle = async () => {
     await supabase.auth.signInWithOAuth({
@@ -19,11 +29,13 @@ export default function LoginPage() {
   const loginWithEmail = async () => {
     if (!email.trim()) return;
     setLoading(true);
-    await supabase.auth.signInWithOtp({
+    setError("");
+    const { error } = await supabase.auth.signInWithOtp({
       email,
       options: { emailRedirectTo: `${location.origin}/auth/callback` },
     });
-    setSent(true);
+    if (error) setError(error.message);
+    else setSent(true);
     setLoading(false);
   };
 
@@ -101,8 +113,28 @@ export default function LoginPage() {
           }}>
             {loading ? "Sending..." : "Send magic link"}
           </button>
+
+          {error && (
+            <p style={{
+              marginTop: 14, fontSize: 13, color: "#ef4444",
+              textAlign: "center", padding: "10px 14px",
+              background: "rgba(239,68,68,0.08)", borderRadius: 10,
+            }}>{error}</p>
+          )}
         </div>
       )}
     </div>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={
+      <div style={{ minHeight: "100vh", background: "#000", display: "flex", alignItems: "center", justifyContent: "center" }}>
+        <span style={{ color: "rgba(255,255,255,0.3)", fontFamily: "sans-serif" }}>Loading...</span>
+      </div>
+    }>
+      <LoginForm />
+    </Suspense>
   );
 }

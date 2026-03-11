@@ -6,6 +6,7 @@ export const metadata: Metadata = {
   description: "Stake real money on your habits",
   manifest: "/manifest.json",
   appleWebApp: { capable: true, statusBarStyle: "black-translucent", title: "BetOnMe" },
+  icons: { icon: "/icon.svg", apple: "/icon.svg" },
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
