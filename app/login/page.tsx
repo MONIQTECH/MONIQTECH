@@ -1,17 +1,51 @@
 "use client";
 
 import { createClient } from "@/lib/supabase/client";
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { useSearchParams } from "next/navigation";
 import { Suspense } from "react";
+
+// Cloudflare Turnstile widget — rendered only when NEXT_PUBLIC_TURNSTILE_SITE_KEY is set
+const TURNSTILE_KEY = process.env.NEXT_PUBLIC_TURNSTILE_SITE_KEY ?? "";
+
+function TurnstileWidget({ onVerified }: { onVerified: (token: string) => void }) {
+  const ref = useRef<HTMLDivElement>(null);
+  const rendered = useRef(false);
+
+  useEffect(() => {
+    if (!TURNSTILE_KEY || rendered.current || !ref.current) return;
+    rendered.current = true;
+
+    const script = document.createElement("script");
+    script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js";
+    script.async = true;
+    script.defer = true;
+    script.onload = () => {
+      (window as unknown as Record<string, unknown>).turnstile?.render(ref.current, {
+        sitekey: TURNSTILE_KEY,
+        theme: "dark",
+        callback: onVerified,
+      });
+    };
+    document.head.appendChild(script);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  if (!TURNSTILE_KEY) return null;
+  return <div ref={ref} style={{ marginBottom: 12 }} />;
+}
 
 function LoginForm() {
   const [email, setEmail] = useState("");
   const [sent, setSent] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
+  const [turnstileToken, setTurnstileToken] = useState("");
   const supabase = createClient();
   const searchParams = useSearchParams();
+
+  const handleTurnstileVerified = useCallback((token: string) => {
+    setTurnstileToken(token);
+  }, []);
 
   useEffect(() => {
     if (searchParams.get("error") === "auth_failed") {
@@ -30,6 +64,27 @@ function LoginForm() {
     if (!email.trim()) return;
     setLoading(true);
     setError("");
+
+    // Verify Turnstile token if configured
+    if (TURNSTILE_KEY) {
+      if (!turnstileToken) {
+        setError("Please complete the bot check.");
+        setLoading(false);
+        return;
+      }
+      const res = await fetch("/api/auth/verify-turnstile", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: turnstileToken }),
+      });
+      const data = await res.json() as { success: boolean };
+      if (!data.success) {
+        setError("Bot check failed. Please refresh and try again.");
+        setLoading(false);
+        return;
+      }
+    }
+
     const { error } = await supabase.auth.signInWithOtp({
       email,
       options: { emailRedirectTo: `${location.origin}/auth/callback` },
@@ -104,6 +159,7 @@ function LoginForm() {
               color: "#f5f5f7", fontSize: 16, fontFamily: "inherit", outline: "none",
             }}
           />
+          <TurnstileWidget onVerified={handleTurnstileVerified} />
           <button onClick={loginWithEmail} disabled={loading} style={{
             width: "100%", padding: 16, borderRadius: 14, border: "none",
             background: email.trim() ? "linear-gradient(135deg, #34d399, #10b981)" : "rgba(255,255,255,0.05)",

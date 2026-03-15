@@ -13,7 +13,7 @@ const securityHeaders = [
     value: [
       "default-src 'self'",
       // Scripts: self + Privy + Google Fonts
-      "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://auth.privy.io https://privy.io",
+      "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://auth.privy.io https://privy.io https://challenges.cloudflare.com",
       // Styles: self + inline (React inline styles) + Google Fonts
       "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
       // Fonts: self + Google Fonts CDN
@@ -23,7 +23,7 @@ const securityHeaders = [
       // API connections: self + Supabase + Privy + Base RPC + WalletConnect
       "connect-src 'self' https://*.supabase.co https://*.supabase.in https://*.privy.io wss://*.supabase.co wss://*.privy.io https://mainnet.base.org https://base.publicnode.com https://*.walletconnect.com wss://*.walletconnect.com https://*.walletconnect.org",
       // Frames: Privy embedded wallet uses iframes across multiple subdomains
-      "frame-src https://*.privy.io https://privy.io https://verify.walletconnect.com",
+      "frame-src https://*.privy.io https://privy.io https://verify.walletconnect.com https://challenges.cloudflare.com",
       "object-src 'none'",
       "base-uri 'self'",
       "form-action 'self'",

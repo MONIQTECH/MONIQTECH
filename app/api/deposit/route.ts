@@ -21,10 +21,10 @@ const USDC_ABI = [
 const publicClient = createPublicClient({ chain: base, transport: http() });
 
 export async function POST(request: Request) {
-  // Rate limit: 10 deposit attempts per user IP per 10 minutes
+  // Rate limit by IP
   const ip = getIp(request);
-  const rl = rateLimit(`deposit:${ip}`, 10, 10 * 60 * 1000);
-  if (!rl.ok) {
+  const rlIp = rateLimit(`deposit:ip:${ip}`, 10, 10 * 60 * 1000);
+  if (!rlIp.ok) {
     return NextResponse.json({ error: "Too many requests. Please wait." }, { status: 429 });
   }
 
@@ -39,6 +39,12 @@ export async function POST(request: Request) {
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+  // Rate limit by user ID (prevents VPN bypass)
+  const rlUser = rateLimit(`deposit:user:${user.id}`, 5, 60 * 60 * 1000); // 5 deposits per hour per user
+  if (!rlUser.ok) {
+    return NextResponse.json({ error: "Deposit limit reached. Max 5 per hour." }, { status: 429 });
+  }
 
   // Client already waited for confirmation — single fast lookup, no timeout risk
   let receipt;

@@ -20,11 +20,13 @@ const USDC_ABI = [
 const MIN_WITHDRAW_CENTS = 100;  // $1 minimum
 const MAX_WITHDRAW_CENTS = 100_000_00; // $10,000 maximum per tx
 
+const WITHDRAW_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour after last deposit
+
 export async function POST(request: Request) {
-  // Rate limit: 5 withdrawal attempts per IP per 15 minutes
+  // Rate limit by IP
   const ip = getIp(request);
-  const rl = rateLimit(`withdraw:${ip}`, 5, 15 * 60 * 1000);
-  if (!rl.ok) {
+  const rlIp = rateLimit(`withdraw:ip:${ip}`, 5, 15 * 60 * 1000);
+  if (!rlIp.ok) {
     return NextResponse.json({ error: "Too many requests. Please wait." }, { status: 429 });
   }
 
@@ -32,6 +34,12 @@ export async function POST(request: Request) {
   const supabase = await createClient();
   const { data: { user } } = await supabase.auth.getUser();
   if (!user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+
+  // Rate limit by user ID (prevents VPN bypass)
+  const rlUser = rateLimit(`withdraw:user:${user.id}`, 3, 60 * 60 * 1000); // 3 per hour per user
+  if (!rlUser.ok) {
+    return NextResponse.json({ error: "Withdrawal limit reached. Max 3 per hour." }, { status: 429 });
+  }
 
   // 2. Parse + validate request
   let amountCents: number;
@@ -66,6 +74,25 @@ export async function POST(request: Request) {
     process.env.NEXT_PUBLIC_SUPABASE_URL!,
     process.env.SUPABASE_SERVICE_ROLE_KEY!
   );
+
+  // 3b. Withdraw cooldown: must wait 1 hour after last deposit
+  //     Prevents instant-cashout fraud (stolen card → deposit → withdraw)
+  const { data: profile } = await admin
+    .from("profiles")
+    .select("last_deposit_at")
+    .eq("id", user.id)
+    .single();
+
+  if (profile?.last_deposit_at) {
+    const msSinceDeposit = Date.now() - new Date(profile.last_deposit_at).getTime();
+    if (msSinceDeposit < WITHDRAW_COOLDOWN_MS) {
+      const minutesLeft = Math.ceil((WITHDRAW_COOLDOWN_MS - msSinceDeposit) / 60_000);
+      return NextResponse.json(
+        { error: `Please wait ${minutesLeft} more minute${minutesLeft !== 1 ? "s" : ""} after your last deposit before withdrawing.` },
+        { status: 429 }
+      );
+    }
+  }
 
   // 4. Atomically deduct balance in DB BEFORE sending on-chain
   //    (prevents double-spend; if on-chain fails we refund)
