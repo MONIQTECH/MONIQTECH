@@ -20,10 +20,10 @@ const securityHeaders = [
       "font-src 'self' https://fonts.gstatic.com",
       // Images: self + data URIs (avatars) + Supabase storage
       "img-src 'self' data: blob: https://*.supabase.co https://*.supabase.in",
-      // API connections: self + Supabase + Privy + Base RPC
-      "connect-src 'self' https://*.supabase.co https://*.supabase.in https://auth.privy.io https://*.privy.io wss://*.supabase.co https://mainnet.base.org https://base.publicnode.com",
-      // Frames: Privy uses an iframe for embedded wallets
-      "frame-src https://auth.privy.io https://privy.io",
+      // API connections: self + Supabase + Privy + Base RPC + WalletConnect
+      "connect-src 'self' https://*.supabase.co https://*.supabase.in https://*.privy.io wss://*.supabase.co wss://*.privy.io https://mainnet.base.org https://base.publicnode.com https://*.walletconnect.com wss://*.walletconnect.com https://*.walletconnect.org",
+      // Frames: Privy embedded wallet uses iframes across multiple subdomains
+      "frame-src https://*.privy.io https://privy.io https://verify.walletconnect.com",
       "object-src 'none'",
       "base-uri 'self'",
       "form-action 'self'",
