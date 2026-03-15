@@ -3,6 +3,25 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { createClient } from "@/lib/supabase/client";
 import type { User } from "@supabase/supabase-js";
+import { usePrivy, useLoginWithEmail, useWallets } from "@privy-io/react-auth";
+import { parseUnits, encodeFunctionData, createPublicClient, http } from "viem";
+import { base } from "viem/chains";
+
+// Read-only Base client — used client-side to wait for tx confirmation
+const baseClient = createPublicClient({ chain: base, transport: http() });
+
+// USDC on Base
+const USDC_ADDRESS = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" as const;
+const BETONME_WALLET = "0xe7F5BDf1C4b5d970431F10ee65dF5b0474199377" as const;
+const USDC_ABI = [
+  {
+    name: "transfer",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [{ name: "to", type: "address" }, { name: "amount", type: "uint256" }],
+    outputs: [{ name: "", type: "bool" }],
+  },
+] as const;
 
 const fmt = (cents: number) => {
   const abs = Math.abs(cents);
@@ -49,6 +68,12 @@ type Habit = {
   id: string; name: string; emoji: string; stake: number;
   done: boolean; streak: number; history: number[];
   saved: number; lost: number; deadline: string;
+  insured: boolean; grace_used_at: string | null;
+};
+
+type Transaction = {
+  id: string; amount: number; type: string;
+  description: string; created_at: string; habit_id: string | null;
 };
 
 // ─── Sheet ────────────────────────────────────────────────────────────────────
@@ -163,6 +188,139 @@ function Confetti({ show }: { show: boolean }) {
   );
 }
 
+// ─── SwipeToDelete ────────────────────────────────────────────────────────────
+function SwipeToDelete({ onDelete, children }: { onDelete: () => void; children: React.ReactNode }) {
+  const innerRef = useRef<HTMLDivElement>(null);
+  const bgRef = useRef<HTMLDivElement>(null);
+  const startX = useRef(0);
+  const startY = useRef(0);
+  const dx = useRef(0);
+  const active = useRef(false);
+
+  const onTouchStart = (e: React.TouchEvent) => {
+    startX.current = e.touches[0].clientX;
+    startY.current = e.touches[0].clientY;
+    dx.current = 0;
+    active.current = false;
+  };
+
+  const onTouchMove = (e: React.TouchEvent) => {
+    const deltaX = e.touches[0].clientX - startX.current;
+    const deltaY = Math.abs(e.touches[0].clientY - startY.current);
+    if (!active.current) {
+      if (Math.abs(deltaX) > 8 && Math.abs(deltaX) > deltaY) active.current = true;
+      else return;
+    }
+    const clamped = Math.min(0, deltaX);
+    dx.current = clamped;
+    const progress = Math.min(1, Math.abs(clamped) / 80);
+    if (innerRef.current) {
+      innerRef.current.style.transform = `translateX(${clamped}px)`;
+      innerRef.current.style.transition = "none";
+    }
+    if (bgRef.current) bgRef.current.style.opacity = String(progress);
+  };
+
+  const onTouchEnd = () => {
+    if (!active.current) return;
+    active.current = false;
+    if (dx.current < -80) {
+      if (innerRef.current) {
+        innerRef.current.style.transform = "translateX(-105%)";
+        innerRef.current.style.opacity = "0";
+        innerRef.current.style.transition = "transform 0.22s ease, opacity 0.22s ease";
+      }
+      setTimeout(onDelete, 230);
+    } else {
+      if (innerRef.current) {
+        innerRef.current.style.transform = "translateX(0)";
+        innerRef.current.style.transition = "transform 0.3s cubic-bezier(.32,.72,.24,1)";
+      }
+      if (bgRef.current) { bgRef.current.style.transition = "opacity 0.3s ease"; bgRef.current.style.opacity = "0"; }
+    }
+    dx.current = 0;
+  };
+
+  return (
+    <div style={{ position: "relative", borderRadius: 20, overflow: "hidden" }}>
+      <div ref={bgRef} style={{
+        position: "absolute", inset: 0, borderRadius: 20, opacity: 0,
+        background: "rgba(239,68,68,0.15)",
+        display: "flex", alignItems: "center", justifyContent: "flex-end",
+        paddingRight: 22,
+      }}>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+          <polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/>
+        </svg>
+      </div>
+      <div ref={innerRef} onTouchStart={onTouchStart} onTouchMove={onTouchMove} onTouchEnd={onTouchEnd}>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// ─── Deposit success burst ────────────────────────────────────────────────────
+function DepositBurst({ amount, onDone }: { amount: number; onDone: () => void }) {
+  useEffect(() => {
+    const t = setTimeout(onDone, 2600);
+    return () => clearTimeout(t);
+  }, [onDone]);
+
+  const coins = Array.from({ length: 28 });
+
+  return (
+    <div onClick={onDone} style={{
+      position: "fixed", inset: 0, zIndex: 2000, display: "flex",
+      alignItems: "center", justifyContent: "center",
+      background: "rgba(0,0,0,0.72)", backdropFilter: "blur(14px)",
+      animation: "fadeBgIn 0.2s ease",
+    }}>
+      {/* Coin particles */}
+      <div style={{ position: "absolute", inset: 0, pointerEvents: "none", overflow: "hidden" }}>
+        {coins.map((_, i) => {
+          const left = `${8 + (i / coins.length) * 84 + (Math.sin(i * 1.7) * 6)}%`;
+          const delay = `${(i / coins.length) * 0.5}s`;
+          const dur = `${0.9 + (i % 5) * 0.15}s`;
+          const size = 10 + (i % 4) * 5;
+          return (
+            <div key={i} style={{
+              position: "absolute", bottom: "10%", left,
+              width: size, height: size, borderRadius: "50%",
+              background: i % 3 === 0 ? "#f59e0b" : i % 3 === 1 ? "#34d399" : "#fbbf24",
+              boxShadow: `0 0 ${size}px ${size / 2}px ${i % 3 === 0 ? "rgba(245,158,11,0.4)" : "rgba(52,211,153,0.4)"}`,
+              opacity: 0,
+              animation: `depositCoin ${dur} ${delay} cubic-bezier(.17,.67,.35,1) forwards`,
+              ["--dx" as string]: `${(Math.random() - 0.5) * 60}px`,
+            }} />
+          );
+        })}
+      </div>
+
+      {/* Card */}
+      <div onClick={e => e.stopPropagation()} style={{
+        background: "rgba(20,20,20,0.95)", borderRadius: 28,
+        border: "1.5px solid rgba(52,211,153,0.3)",
+        padding: "36px 40px", textAlign: "center",
+        boxShadow: "0 0 80px rgba(52,211,153,0.15), 0 32px 64px rgba(0,0,0,0.6)",
+        animation: "depositCardPop 0.4s cubic-bezier(.34,1.56,.64,1) forwards",
+        minWidth: 240,
+      }}>
+        <div style={{ fontSize: 52, marginBottom: 12, animation: "depositCoinSpin 0.5s ease" }}>💰</div>
+        <p style={{ fontSize: 13, fontWeight: 600, color: "rgba(52,211,153,0.7)", letterSpacing: 2, textTransform: "uppercase", marginBottom: 8 }}>Deposited</p>
+        <p style={{
+          fontFamily: "'JetBrains Mono', monospace", fontSize: 42, fontWeight: 700,
+          color: "#34d399", letterSpacing: -1,
+          animation: "depositNumPop 0.5s 0.15s cubic-bezier(.34,1.4,.64,1) both",
+        }}>
+          +{fmt(amount)}
+        </p>
+        <p style={{ fontSize: 13, color: "rgba(255,255,255,0.3)", marginTop: 10 }}>Balance updated</p>
+      </div>
+    </div>
+  );
+}
+
 // ─── Victory overlay ──────────────────────────────────────────────────────────
 function WinOverlay({ show, savedToday, onDismiss, onShare }: { show: boolean; savedToday: number; onDismiss: () => void; onShare: () => void }) {
   useEffect(() => {
@@ -251,12 +409,211 @@ export default function Dashboard({ user }: { user: User }) {
   const [showProfile, setShowProfile] = useState(false);
   const [showOnboarding, setShowOnboarding] = useState(false);
   const [showWin, setShowWin] = useState(false);
-  const [newH, setNewH] = useState({ name: "", emoji: "✨", stake: 500 });
+  const [newH, setNewH] = useState({ name: "", emoji: "✨", stake: 500, insured: false });
   const [addError, setAddError] = useState("");
   const [adding, setAdding] = useState(false);
   const [animateDoneIds, setAnimateDoneIds] = useState(new Set<string>());
   const prevAllDone = useRef(false);
   const togglingIds = useRef(new Set<string>());
+
+  // Privy
+  const { ready: privyReady, authenticated: privyAuthed, createWallet } = usePrivy();
+  const { sendCode, loginWithCode, state: emailLoginState } = useLoginWithEmail();
+  const { wallets } = useWallets();
+  // Ref keeps latest wallets accessible inside stale closures (handleDeposit useCallback)
+  const walletsRef = useRef(wallets);
+  useEffect(() => { walletsRef.current = wallets; }, [wallets]);
+
+  // Custom Privy login sheet state
+  const [showPrivyLogin, setShowPrivyLogin] = useState(false);
+  const [privyEmail, setPrivyEmail] = useState("");
+  const [privyCode, setPrivyCode] = useState("");
+  const [privyLoginStep, setPrivyLoginStep] = useState<"email" | "code">("email");
+  const [privyLoginLoading, setPrivyLoginLoading] = useState(false);
+  const [privyLoginError, setPrivyLoginError] = useState("");
+
+  // Wallet
+  const [balance, setBalance] = useState(0);
+  const [showWallet, setShowWallet] = useState(false);
+  const [transactions, setTransactions] = useState<Transaction[]>([]);
+  const [txLoading, setTxLoading] = useState(false);
+  const [depositAmount, setDepositAmount] = useState("10");
+  const [depositLoading, setDepositLoading] = useState(false);
+  const [depositError, setDepositError] = useState("");
+  const [depositSuccess, setDepositSuccess] = useState(0); // cents, 0 = hidden
+  const pendingDeposit = useRef(false);
+
+  // Withdraw state
+  const [walletTab, setWalletTab] = useState<"deposit" | "withdraw">("deposit");
+  const [withdrawAmount, setWithdrawAmount] = useState("10");
+  const [withdrawAddress, setWithdrawAddress] = useState("");
+  const [withdrawLoading, setWithdrawLoading] = useState(false);
+  const [withdrawError, setWithdrawError] = useState("");
+  const [withdrawSuccess, setWithdrawSuccess] = useState(0); // cents, 0 = hidden
+
+  // Auto-trigger deposit after Privy login + wallet ready
+  // wallets is checked too because the embedded wallet is created async after auth
+  useEffect(() => {
+    if (privyAuthed && wallets.length > 0 && pendingDeposit.current) {
+      pendingDeposit.current = false;
+      setShowPrivyLogin(false);
+      handleDeposit();
+    }
+  }, [privyAuthed, wallets]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleSendCode = useCallback(async () => {
+    if (!privyEmail.includes("@")) { setPrivyLoginError("Enter valid email"); return; }
+    setPrivyLoginLoading(true);
+    setPrivyLoginError("");
+    try {
+      await sendCode({ email: privyEmail });
+      setPrivyLoginStep("code");
+    } catch {
+      setPrivyLoginError("Failed to send code. Try again.");
+    } finally {
+      setPrivyLoginLoading(false);
+    }
+  }, [privyEmail, sendCode]);
+
+  const handleVerifyCode = useCallback(async () => {
+    if (privyCode.length < 4) { setPrivyLoginError("Enter the code from email"); return; }
+    setPrivyLoginLoading(true);
+    setPrivyLoginError("");
+    try {
+      await loginWithCode({ code: privyCode });
+      // useEffect above will fire when privyAuthed becomes true
+    } catch {
+      setPrivyLoginError("Wrong code. Try again.");
+    } finally {
+      setPrivyLoginLoading(false);
+    }
+  }, [privyCode, loginWithCode]);
+
+  const handleDeposit = useCallback(async () => {
+    setDepositError("");
+    const dollars = parseFloat(depositAmount);
+    if (!dollars || dollars < 1) { setDepositError("Minimum $1"); return; }
+
+    if (!privyAuthed) {
+      pendingDeposit.current = true;
+      setPrivyLoginStep("email");
+      setPrivyLoginError("");
+      setPrivyEmail("");
+      setPrivyCode("");
+      setShowPrivyLogin(true);
+      return;
+    }
+
+    setDepositLoading(true);
+    try {
+      // Always read from ref — avoids stale closure capturing old wallets array
+      let embeddedWallet = walletsRef.current.find(w => w.walletClientType === "privy");
+      if (!embeddedWallet) {
+        try {
+          await createWallet();
+          // Wait for Privy to update wallets state then re-read via ref
+          await new Promise(r => setTimeout(r, 1500));
+          embeddedWallet = walletsRef.current.find(w => w.walletClientType === "privy");
+        } catch {
+          // ignore — wallet may already exist
+        }
+      }
+      if (!embeddedWallet) {
+        setDepositError("Wallet setup failed. Please try again.");
+        setDepositLoading(false);
+        return;
+      }
+
+      // Get EIP-1193 provider from the wallet
+      const provider = await embeddedWallet.getEthereumProvider();
+
+      // Switch to Base (0x2105 = 8453) via provider — avoids switchChain() Privy bug
+      try {
+        await provider.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0x2105" }] });
+      } catch { /* already on Base or unsupported — proceed */ }
+
+      const usdcAmount = parseUnits(dollars.toFixed(6), 6);
+      const data = encodeFunctionData({ abi: USDC_ABI, functionName: "transfer", args: [BETONME_WALLET, usdcAmount] });
+
+      // 1. Broadcast tx directly via wallet provider
+      const hash = await provider.request({
+        method: "eth_sendTransaction",
+        params: [{ to: USDC_ADDRESS, from: embeddedWallet.address, data }],
+      }) as `0x${string}`;
+
+      // Save to localStorage — recovery if browser closes before confirmation
+      localStorage.setItem("betonme_pending_tx", JSON.stringify({ txHash: hash, ts: Date.now() }));
+
+      // 2. Wait for on-chain confirmation CLIENT-SIDE (Base ~2s/block)
+      //    This avoids Vercel's 10s serverless timeout — client has no timeout limit
+      await baseClient.waitForTransactionReceipt({ hash, timeout: 120_000 });
+
+      // 3. Tell server to verify + credit (tx is already confirmed, so server-side is instant)
+      const res = await fetch("/api/deposit", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ txHash: hash }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "Failed to credit balance");
+
+      localStorage.removeItem("betonme_pending_tx");
+      setBalance(prev => prev + json.credited);
+      setDepositAmount("10");
+      setDepositSuccess(json.credited);
+      haptic([10, 30, 50, 30, 10]);
+    } catch (e: unknown) {
+      localStorage.removeItem("betonme_pending_tx");
+      const msg = e instanceof Error ? e.message : "Transaction failed";
+      let friendly = msg;
+      if (msg.toLowerCase().includes("rejected") || msg.toLowerCase().includes("denied") || msg.toLowerCase().includes("cancel")) {
+        friendly = "Cancelled";
+      } else if (msg.toLowerCase().includes("insufficient") || msg.toLowerCase().includes("transfer amount exceeds balance")) {
+        friendly = "Not enough USDC on your wallet. Buy USDC on Base first.";
+      } else if (msg.toLowerCase().includes("no embedded") || msg.toLowerCase().includes("no connected") || msg.toLowerCase().includes("wallet not found")) {
+        friendly = "Wallet not ready. Please try again in a moment.";
+      }
+      setDepositError(friendly);
+    } finally {
+      setDepositLoading(false);
+    }
+  }, [depositAmount, privyAuthed, createWallet]);
+
+  // Auto-fill withdraw address from Privy embedded wallet
+  useEffect(() => {
+    const embedded = walletsRef.current.find(w => w.walletClientType === "privy");
+    if (embedded && !withdrawAddress) setWithdrawAddress(embedded.address);
+  }, [wallets]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleWithdraw = useCallback(async () => {
+    setWithdrawError("");
+    const dollars = parseFloat(withdrawAmount);
+    if (!dollars || dollars < 1) { setWithdrawError("Minimum $1"); return; }
+    const amountCents = Math.floor(dollars * 100);
+    if (amountCents > balance) { setWithdrawError(`Max ${fmt(balance)}`); return; }
+    if (!withdrawAddress || withdrawAddress.length < 10) { setWithdrawError("Enter wallet address"); return; }
+
+    setWithdrawLoading(true);
+    try {
+      const res = await fetch("/api/withdraw", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ amountCents, toAddress: withdrawAddress }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "Withdrawal failed");
+      setBalance(prev => prev - json.withdrawn);
+      setWithdrawSuccess(json.withdrawn);
+      setWithdrawAmount("10");
+      haptic([10, 30, 50, 30, 10]);
+      setTimeout(() => setWithdrawSuccess(0), 4000);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : "Withdrawal failed";
+      setWithdrawError(msg);
+    } finally {
+      setWithdrawLoading(false);
+    }
+  }, [withdrawAmount, withdrawAddress, balance]);
 
   // Profile edit state
   const [profileName, setProfileName] = useState(user.user_metadata?.full_name || "");
@@ -268,9 +625,10 @@ export default function Dashboard({ user }: { user: User }) {
   const [displayName, setDisplayName] = useState(user.user_metadata?.full_name || user.email?.split("@")[0] || "?");
   const [avatarColor, setAvatarColor] = useState(user.user_metadata?.avatar_color || AVATAR_COLORS[0]);
   const [avatarUrl, setAvatarUrl] = useState<string>(user.user_metadata?.avatar_url || "");
-  const [onboardingDone, setOnboardingDone] = useState(!!user.user_metadata?.birth_date);
+  const [onboardingDone, setOnboardingDone] = useState(!!(user.user_metadata?.onboarding_done || user.user_metadata?.birth_date));
   const [avatarUploading, setAvatarUploading] = useState(false);
   const [avatarError, setAvatarError] = useState("");
+  const [profileLinkCopied, setProfileLinkCopied] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   // Push notifications
@@ -287,10 +645,7 @@ export default function Dashboard({ user }: { user: User }) {
   }, []);
 
   const togglePush = async () => {
-    if (!("serviceWorker" in navigator) || !("PushManager" in window)) {
-      alert("Push notifications are not supported in this browser.");
-      return;
-    }
+    if (!("serviceWorker" in navigator) || !("PushManager" in window)) return;
     setPushLoading(true);
     try {
       const reg = await navigator.serviceWorker.ready;
@@ -324,24 +679,94 @@ export default function Dashboard({ user }: { user: User }) {
   useEffect(() => {
     const load = async () => {
       await supabase.auth.getSession();
-      const [{ data: rows }, { data: entries }] = await Promise.all([
+
+      // Build last-7-days date range for history
+      const last7Dates = Array.from({ length: 7 }, (_, i) => {
+        const d = new Date();
+        d.setDate(d.getDate() - (6 - i));
+        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+      });
+      const sevenDaysAgo = last7Dates[0];
+
+      const [{ data: rows }, { data: entries }, { data: recentEntries }] = await Promise.all([
         supabase.from("habits").select("*").order("created_at"),
         supabase.from("habit_entries").select("habit_id, completed").eq("date", today()),
+        supabase.from("habit_entries")
+          .select("habit_id, date, completed")
+          .gte("date", sevenDaysAgo)
+          .order("date"),
       ]);
+
+      // Build per-habit date→completed map for history
+      const recentByHabit = new Map<string, Map<string, boolean>>();
+      for (const e of recentEntries ?? []) {
+        if (!recentByHabit.has(e.habit_id)) recentByHabit.set(e.habit_id, new Map());
+        recentByHabit.get(e.habit_id)!.set(e.date, e.completed);
+      }
+
       const doneMap = new Map((entries ?? []).map(e => [e.habit_id, e.completed]));
-      const mapped = (rows ?? []).map(h => ({ ...h, done: doneMap.get(h.id) ?? false }));
+      const mapped = (rows ?? []).map(h => {
+        const habitDates = recentByHabit.get(h.id);
+        // Only include dates where an entry exists — shows wins (1) and losses (0)
+        const history = last7Dates
+          .filter(date => habitDates?.has(date))
+          .map(date => habitDates!.get(date) ? 1 : 0);
+        return { ...h, done: doneMap.get(h.id) ?? false, history };
+      });
       // Init prevAllDone so we don't trigger win overlay on page load if already all done
       prevAllDone.current = mapped.length > 0 && mapped.every(h => h.done);
       setHabits(mapped);
+
+      // Load wallet balance + avatar from profiles table (source of truth after sign-out/in)
+      const { data: profile } = await supabase.from("profiles").select("balance, avatar_url").eq("id", user.id).single();
+      setBalance(profile?.balance ?? 0);
+      if (profile?.avatar_url) setAvatarUrl(profile.avatar_url);
+
+      // Recovery: if user closed browser mid-deposit, try to credit the pending tx
+      const pending = localStorage.getItem("betonme_pending_tx");
+      if (pending) {
+        try {
+          const { txHash, ts } = JSON.parse(pending);
+          const age = Date.now() - ts;
+          if (txHash && age < 3_600_000) { // only retry within 1 hour
+            const res = await fetch("/api/deposit", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ txHash }),
+            });
+            const json = await res.json();
+            if (res.ok) setBalance(prev => prev + json.credited);
+          }
+        } catch { /* ignore */ }
+        localStorage.removeItem("betonme_pending_tx");
+      }
+
       setLoading(false);
     };
     load();
   }, [supabase]);
 
-  // Show onboarding if birth date not set
+  // Show onboarding if not yet completed
   useEffect(() => {
     if (!loading && !onboardingDone) setShowOnboarding(true);
   }, [loading, onboardingDone]);
+
+  const skipOnboarding = () => {
+    setShowOnboarding(false);
+    setOnboardingDone(true);
+  };
+
+  const loadTransactions = useCallback(async () => {
+    setTxLoading(true);
+    const { data } = await supabase
+      .from("transactions")
+      .select("*")
+      .eq("user_id", user.id)
+      .order("created_at", { ascending: false })
+      .limit(50);
+    setTransactions(data ?? []);
+    setTxLoading(false);
+  }, [supabase, user.id]);
 
   const risk = habits.filter(h => !h.done).reduce((s, h) => s + h.stake, 0);
   const done = habits.filter(h => h.done).length;
@@ -354,7 +779,7 @@ export default function Dashboard({ user }: { user: User }) {
   const savedToday = habits.filter(h => h.done).reduce((s, h) => s + h.stake, 0);
 
   const avatarLetter = displayName[0].toUpperCase();
-  const memberSince = new Date(user.created_at).toLocaleDateString("en-US", { month: "long", year: "numeric" });
+  const memberSince = user.created_at ? new Date(user.created_at).toLocaleDateString("en-US", { month: "long", year: "numeric" }) : "";
 
   // Check for victory moment
   useEffect(() => {
@@ -369,6 +794,8 @@ export default function Dashboard({ user }: { user: User }) {
   const toggle = async (id: string) => {
     if (togglingIds.current.has(id)) return; // prevent double-tap corruption
     togglingIds.current.add(id);
+    // Safety: always release lock after 10s even if something hangs
+    const lockTimeout = setTimeout(() => togglingIds.current.delete(id), 10_000);
 
     const habit = habits.find(h => h.id === id);
     if (!habit) { togglingIds.current.delete(id); return; }
@@ -378,29 +805,27 @@ export default function Dashboard({ user }: { user: User }) {
     haptic(nowDone ? [10, 30, 15] : 8);
     setHabits(prev => prev.map(h => h.id !== id ? h : { ...h, done: nowDone }));
 
-    const { error } = await supabase.from("habit_entries").upsert(
-      { habit_id: id, user_id: user.id, date: today(), completed: nowDone },
-      { onConflict: "habit_id,date" }
-    );
+    // Atomic: upsert entry + update streak/saved in one DB transaction
+    const { data: result, error } = await supabase.rpc("toggle_habit_entry", {
+      p_habit_id: id,
+      p_date: today(),
+      p_completed: nowDone,
+    });
     if (error) {
       setHabits(prev => prev.map(h => h.id !== id ? h : { ...h, done: wasDone }));
+      clearTimeout(lockTimeout);
       togglingIds.current.delete(id);
       return;
     }
 
-    const newStreak = nowDone ? habit.streak + 1 : Math.max(0, habit.streak - 1);
-    const newSaved = nowDone ? habit.saved + habit.stake : Math.max(0, habit.saved - habit.stake);
-    const { error: updateError } = await supabase.from("habits").update({ streak: newStreak, saved: newSaved }).eq("id", id);
-    if (updateError) {
-      // Revert all local changes if DB update fails
-      setHabits(prev => prev.map(h => h.id !== id ? h : { ...h, done: wasDone, streak: habit.streak, saved: habit.saved }));
-    } else {
-      setHabits(prev => prev.map(h => h.id !== id ? h : { ...h, streak: newStreak, saved: newSaved }));
-      if (nowDone) {
-        setAnimateDoneIds(prev => new Set([...prev, id]));
-        setTimeout(() => setAnimateDoneIds(prev => { const s = new Set(prev); s.delete(id); return s; }), 500);
-      }
+    const newStreak = (result as { streak: number; saved: number }).streak;
+    const newSaved  = (result as { streak: number; saved: number }).saved;
+    setHabits(prev => prev.map(h => h.id !== id ? h : { ...h, streak: newStreak, saved: newSaved }));
+    if (nowDone) {
+      setAnimateDoneIds(prev => new Set([...prev, id]));
+      setTimeout(() => setAnimateDoneIds(prev => { const s = new Set(prev); s.delete(id); return s; }), 500);
     }
+    clearTimeout(lockTimeout);
     togglingIds.current.delete(id);
   };
 
@@ -415,20 +840,50 @@ export default function Dashboard({ user }: { user: User }) {
     }
   };
 
+  const insuranceFee = (stake: number) => Math.max(50, Math.round(stake * 0.05)); // min $0.50
+
   const add = async () => {
     if (!newH.name.trim() || adding) return;
+    // Input validation
+    if (newH.name.trim().length > 100) { setAddError("Name is too long (max 100 characters)"); return; }
+    if (newH.stake < 50 || newH.stake > 1_000_000) { setAddError("Stake must be between $0.50 and $10,000"); return; }
     setAdding(true);
     setAddError("");
     const { data: { session } } = await supabase.auth.getSession();
     if (!session) { setAddError("Session expired. Please sign out and sign in again."); setAdding(false); return; }
+
+    // If insured — check balance covers the fee
+    if (newH.insured) {
+      const fee = insuranceFee(newH.stake);
+      if (balance < fee) { setAddError(`Need ${fmt(fee)} for insurance. Top up your balance first.`); setAdding(false); return; }
+    }
+
     const { data, error } = await supabase.from("habits").insert({
-      user_id: user.id, name: newH.name.trim(), emoji: newH.emoji, stake: newH.stake,
+      user_id: user.id, name: newH.name.trim(), emoji: newH.emoji, stake: newH.stake, insured: newH.insured,
     }).select().single();
     if (error) { setAddError(error.message); setAdding(false); return; }
+
+    // Deduct insurance fee from balance
+    if (data && newH.insured) {
+      const { error: feeErr } = await supabase.rpc("charge_insurance_fee", {
+        p_stake: newH.stake,
+        p_emoji: newH.emoji,
+        p_name: newH.name.trim(),
+      });
+      if (feeErr) {
+        // Fee failed — delete the habit we just created to keep data consistent
+        await supabase.from("habits").delete().eq("id", data.id);
+        setAddError("Failed to charge insurance fee. Please try again.");
+        setAdding(false);
+        return;
+      }
+      setBalance(prev => prev - insuranceFee(newH.stake));
+    }
+
     if (data) {
       haptic([10, 20, 10]);
       setHabits(p => [...p, { ...data, done: false }]);
-      setNewH({ name: "", emoji: "✨", stake: 500 });
+      setNewH({ name: "", emoji: "✨", stake: 500, insured: false });
       setShowAdd(false);
     }
     setAdding(false);
@@ -436,6 +891,7 @@ export default function Dashboard({ user }: { user: User }) {
 
   const uploadPhoto = async (file: File) => {
     if (!file.type.startsWith("image/")) return;
+    if (file.size > 5 * 1024 * 1024) { setAvatarError("Image must be under 5MB"); return; }
     setAvatarUploading(true);
     setAvatarError("");
     // Always use .jpg path to avoid stale old-extension files
@@ -450,9 +906,21 @@ export default function Dashboard({ user }: { user: User }) {
       return;
     }
     const { data: { publicUrl } } = supabase.storage.from("avatars").getPublicUrl(path);
+    // Validate the URL is a Supabase storage URL — never store arbitrary URLs
+    const supabaseBase = process.env.NEXT_PUBLIC_SUPABASE_URL!;
+    if (!publicUrl.startsWith(supabaseBase)) {
+      setAvatarError("Unexpected storage URL. Please try again.");
+      setAvatarUploading(false);
+      return;
+    }
     // Cache-bust so browser loads the new image, not the CDN-cached old one
     const urlWithTs = `${publicUrl}?v=${Date.now()}`;
     await supabase.auth.updateUser({ data: { avatar_url: urlWithTs } });
+    // Also persist to profiles table — auth metadata can lag on next login
+    await supabase.from("profiles").upsert(
+      { id: user.id, avatar_url: urlWithTs },
+      { onConflict: "id" }
+    );
     setAvatarUrl(urlWithTs);
     setAvatarUploading(false);
   };
@@ -460,16 +928,38 @@ export default function Dashboard({ user }: { user: User }) {
   const saveProfile = async () => {
     setProfileSaving(true);
     const { error } = await supabase.auth.updateUser({
-      data: { full_name: profileName.trim(), birth_date: profileBirth, avatar_color: profileColor },
+      data: { full_name: profileName.trim(), birth_date: profileBirth, avatar_color: profileColor, onboarding_done: true },
     });
     if (!error) {
+      // Sync to profiles table so public page has fresh data
+      await supabase.from("profiles").upsert({
+        id: user.id,
+        display_name: profileName.trim() || displayName,
+        avatar_color: profileColor,
+        avatar_url: avatarUrl || null,
+      }, { onConflict: "id" });
+      // profiles upsert is best-effort — auth metadata is source of truth
+
       if (profileName.trim()) setDisplayName(profileName.trim());
       setAvatarColor(profileColor);
-      if (profileBirth) setOnboardingDone(true);
+      setOnboardingDone(true);
       setShowProfile(false);
       setShowOnboarding(false);
     }
     setProfileSaving(false);
+  };
+
+  const shareProfile = async () => {
+    haptic([10, 20, 10]);
+    const url = `${window.location.origin}/u/${user.id}`;
+    if (navigator.share) {
+      await navigator.share({ title: `${displayName} on BetOnMe`, url }).catch(() => {});
+    } else {
+      await navigator.clipboard.writeText(url).catch(() => {});
+      // brief toast feedback handled below via state
+    }
+    setProfileLinkCopied(true);
+    setTimeout(() => setProfileLinkCopied(false), 2000);
   };
 
   const signOut = async () => {
@@ -521,6 +1011,7 @@ export default function Dashboard({ user }: { user: User }) {
           80% { opacity: 1; }
           100% { transform: translateY(-100vh) rotate(var(--rot, 540deg)); opacity: 0; }
         }
+        @keyframes txSlide { from { opacity:0; transform:translateX(-8px); } to { opacity:1; transform:translateX(0); } }
         @keyframes winPop {
           0% { transform: scale(0.6); opacity: 0; }
           100% { transform: scale(1); opacity: 1; }
@@ -530,12 +1021,34 @@ export default function Dashboard({ user }: { user: User }) {
           55% { transform: scale(1.1); }
           100% { transform: scale(1); }
         }
+        @keyframes depositCoin {
+          0%   { opacity: 0; transform: translateY(0) translateX(0) scale(0.4); }
+          15%  { opacity: 1; }
+          80%  { opacity: 0.8; }
+          100% { opacity: 0; transform: translateY(-55vh) translateX(var(--dx, 0px)) scale(1); }
+        }
+        @keyframes depositCardPop {
+          0%   { opacity: 0; transform: scale(0.7) translateY(30px); }
+          100% { opacity: 1; transform: scale(1) translateY(0); }
+        }
+        @keyframes depositNumPop {
+          0%   { opacity: 0; transform: scale(0.5); }
+          100% { opacity: 1; transform: scale(1); }
+        }
+        @keyframes depositCoinSpin {
+          0%   { transform: scale(0.5) rotate(-20deg); }
+          60%  { transform: scale(1.2) rotate(10deg); }
+          100% { transform: scale(1) rotate(0deg); }
+        }
         .avatar-edit:hover .avatar-cam, .avatar-edit:active .avatar-cam { opacity: 1 !important; }
         button { -webkit-tap-highlight-color: transparent; }
         button:active { transform: scale(0.96) !important; opacity: 0.82 !important; transition: transform 0.08s ease, opacity 0.08s ease !important; }
         input { transition: border-color 0.2s ease, box-shadow 0.2s ease; }
         input:focus { border-color: rgba(52,211,153,0.4) !important; box-shadow: 0 0 0 3px rgba(52,211,153,0.08) !important; outline: none !important; }
       `}</style>
+
+      {/* Deposit success burst */}
+      {depositSuccess > 0 && <DepositBurst amount={depositSuccess} onDone={() => setDepositSuccess(0)} />}
 
       {/* Confetti layer */}
       <Confetti show={showWin} />
@@ -579,12 +1092,42 @@ export default function Dashboard({ user }: { user: User }) {
             </div>
             <div>
               <p style={{ fontSize: 14, fontWeight: 600, color: "#f5f5f7", marginBottom: 2 }}>{displayName}</p>
-              <p style={{ fontSize: 12, color: "rgba(255,255,255,0.3)" }}>{user.email}</p>
+              <p style={{ fontSize: 12, color: "rgba(255,255,255,0.3)" }}>Member since {memberSince}</p>
             </div>
           </div>
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.2)" strokeWidth="2" strokeLinecap="round">
             <path d="M9 18l6-6-6-6"/>
           </svg>
+        </div>
+
+        {/* WALLET CARD */}
+        <div onClick={() => { haptic(8); setShowWallet(true); loadTransactions(); }} style={{
+          marginBottom: 16, padding: "14px 18px",
+          background: "rgba(255,255,255,0.03)", borderRadius: 18,
+          border: "1px solid rgba(255,255,255,0.06)",
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          cursor: "pointer", WebkitTapHighlightColor: "transparent",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{
+              width: 36, height: 36, borderRadius: 10, flexShrink: 0,
+              background: "linear-gradient(135deg, rgba(52,211,153,0.15), rgba(59,130,246,0.1))",
+              border: "1px solid rgba(52,211,153,0.12)",
+              display: "flex", alignItems: "center", justifyContent: "center", fontSize: 17,
+            }}>💰</div>
+            <div>
+              <p style={{ fontSize: 11, color: "rgba(255,255,255,0.3)", fontWeight: 500, letterSpacing: 0.5, marginBottom: 2 }}>WALLET</p>
+              <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 18, fontWeight: 700, color: balance >= 0 ? "#34d399" : "#ef4444" }}>
+                {fmt(balance)}
+              </span>
+            </div>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+            <span style={{ fontSize: 12, color: "rgba(255,255,255,0.2)", fontWeight: 500 }}>History</span>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="rgba(255,255,255,0.2)" strokeWidth="2" strokeLinecap="round">
+              <path d="M9 18l6-6-6-6"/>
+            </svg>
+          </div>
         </div>
 
         {/* HERO RISK CARD */}
@@ -651,69 +1194,72 @@ export default function Dashboard({ user }: { user: User }) {
 
         {/* TODAY */}
         {tab === "today" && (
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 10, animation: "slideIn .3s ease" }}>
             {habits.length === 0 && (
               <div style={{ textAlign: "center", padding: "48px 0", color: "rgba(255,255,255,0.15)", fontSize: 14 }}>
                 No bets yet. Add your first habit below.
               </div>
             )}
             {habits.map((h, i) => (
-              <div key={h.id} style={{
-                background: h.done ? "linear-gradient(135deg, rgba(52,211,153,0.06) 0%, rgba(0,0,0,0) 100%)" : "rgba(255,255,255,0.02)",
-                borderRadius: 20, padding: "18px 18px",
-                border: `1px solid ${h.done ? "rgba(52,211,153,0.1)" : "rgba(255,255,255,0.04)"}`,
-                animation: `slideIn .45s ease ${i * 0.06}s both`,
-                cursor: "pointer", userSelect: "none",
-                transition: "background 0.3s ease, border-color 0.3s ease",
-              }} onClick={() => toggle(h.id)}>
-                <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
-                  <div style={{
-                    width: 46, height: 46, borderRadius: 23, flexShrink: 0,
-                    background: h.done ? "linear-gradient(135deg, #34d399, #10b981)" : "rgba(255,255,255,0.03)",
-                    border: h.done ? "none" : "1.5px solid rgba(255,255,255,0.1)",
-                    display: "flex", alignItems: "center", justifyContent: "center",
-                    boxShadow: h.done ? "0 4px 18px rgba(16,185,129,0.2)" : "none",
-                    transition: "background 0.3s ease, box-shadow 0.3s ease",
-                    animation: animateDoneIds.has(h.id) ? "checkBounce 0.35s cubic-bezier(.34,1.56,.64,1)" : "none",
-                  }}>
-                    {h.done ? (
-                      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
-                        <polyline points="20 6 9 17 4 12"/>
-                      </svg>
-                    ) : <span style={{ fontSize: 20 }}>{h.emoji}</span>}
-                  </div>
-
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    <p style={{
-                      fontSize: 15, fontWeight: 600, marginBottom: 5,
-                      color: h.done ? "rgba(255,255,255,0.35)" : "#f5f5f7",
-                      textDecoration: h.done ? "line-through" : "none",
-                      transition: "color 0.3s ease",
-                    }}>{h.name}</p>
-                    <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                      {h.streak > 0 && (
-                        <span style={{ display: "inline-flex", alignItems: "center", gap: 3 }}>
-                          <Fire streak={h.streak} />
-                          <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, fontWeight: 700, color: h.streak >= 7 ? "#f59e0b" : "rgba(255,255,255,0.35)" }}>
-                            {h.streak}d
-                          </span>
-                        </span>
-                      )}
-                      {h.history.length > 0 && (
-                        <div style={{ display: "flex", alignItems: "end", gap: 2 }}>
-                          {h.history.slice(-7).map((d, j) => (
-                            <div key={j} style={{
-                              width: 5, height: d ? 14 : 5, borderRadius: 2.5,
-                              background: d ? "linear-gradient(180deg, #34d399, #10b981)" : "rgba(239,68,68,0.25)",
-                            }} />
-                          ))}
-                        </div>
-                      )}
+              <SwipeToDelete key={h.id} onDelete={() => remove(h.id)}>
+                <div style={{
+                  background: h.done ? "linear-gradient(135deg, rgba(52,211,153,0.06) 0%, rgba(0,0,0,0) 100%)" : "rgba(255,255,255,0.02)",
+                  borderRadius: 20, padding: "18px 18px",
+                  border: `1px solid ${h.done ? "rgba(52,211,153,0.1)" : "rgba(255,255,255,0.04)"}`,
+                  animation: `slideIn .45s ease ${i * 0.06}s both`,
+                  cursor: "pointer", userSelect: "none",
+                  transition: "background 0.3s ease, border-color 0.3s ease",
+                }} onClick={() => toggle(h.id)}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 14 }}>
+                    <div style={{
+                      width: 46, height: 46, borderRadius: 23, flexShrink: 0,
+                      background: h.done ? "linear-gradient(135deg, #34d399, #10b981)" : "rgba(255,255,255,0.03)",
+                      border: h.done ? "none" : "1.5px solid rgba(255,255,255,0.1)",
+                      display: "flex", alignItems: "center", justifyContent: "center",
+                      boxShadow: h.done ? "0 4px 18px rgba(16,185,129,0.2)" : "none",
+                      transition: "background 0.3s ease, box-shadow 0.3s ease",
+                      animation: animateDoneIds.has(h.id) ? "checkBounce 0.35s cubic-bezier(.34,1.56,.64,1)" : "none",
+                    }}>
+                      {h.done ? (
+                        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#fff" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                          <polyline points="20 6 9 17 4 12"/>
+                        </svg>
+                      ) : <span style={{ fontSize: 20 }}>{h.emoji}</span>}
                     </div>
-                  </div>
 
-                  <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 8, flexShrink: 0 }}>
-                    <div style={{ textAlign: "right" }}>
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 5, marginBottom: 5 }}>
+                        <p style={{
+                          fontSize: 15, fontWeight: 600,
+                          color: h.done ? "rgba(255,255,255,0.35)" : "#f5f5f7",
+                          textDecoration: h.done ? "line-through" : "none",
+                          transition: "color 0.3s ease",
+                        }}>{h.name}</p>
+                        {h.insured && <span style={{ fontSize: 13, lineHeight: 1 }} title="Insured">🛡️</span>}
+                      </div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                        {h.streak > 0 && (
+                          <span style={{ display: "inline-flex", alignItems: "center", gap: 3 }}>
+                            <Fire streak={h.streak} />
+                            <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 12, fontWeight: 700, color: h.streak >= 7 ? "#f59e0b" : "rgba(255,255,255,0.35)" }}>
+                              {h.streak}d
+                            </span>
+                          </span>
+                        )}
+                        {(h.history?.length ?? 0) > 0 && (
+                          <div style={{ display: "flex", alignItems: "end", gap: 2 }}>
+                            {(h.history ?? []).slice(-7).map((d, j) => (
+                              <div key={j} style={{
+                                width: 5, height: d ? 14 : 5, borderRadius: 2.5,
+                                background: d ? "linear-gradient(180deg, #34d399, #10b981)" : "rgba(239,68,68,0.25)",
+                              }} />
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    <div style={{ textAlign: "right", flexShrink: 0 }}>
                       <p style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 17, fontWeight: 700, color: h.done ? "#34d399" : "#ef4444", transition: "color 0.3s ease" }}>
                         {fmt(h.stake)}
                       </p>
@@ -721,14 +1267,9 @@ export default function Dashboard({ user }: { user: User }) {
                         {h.done ? "secured" : "at risk"}
                       </p>
                     </div>
-                    <button onClick={e => { e.stopPropagation(); remove(h.id); }} style={{
-                      background: "rgba(239,68,68,0.1)", border: "1px solid rgba(239,68,68,0.25)",
-                      borderRadius: 8, cursor: "pointer", color: "rgba(239,68,68,0.8)",
-                      padding: "4px 10px", fontSize: 12, fontWeight: 600, fontFamily: "inherit",
-                    }}>Delete</button>
                   </div>
                 </div>
-              </div>
+              </SwipeToDelete>
             ))}
 
             <button onClick={() => { haptic(8); setShowAdd(true); }} style={{
@@ -775,7 +1316,8 @@ export default function Dashboard({ user }: { user: User }) {
                 </div>
 
                 {habits.map((h, i) => {
-                  const rate = h.history.length ? Math.round(h.history.filter(Boolean).length / h.history.length * 100) : 0;
+                  const hist = h.history ?? [];
+                  const rate = hist.length ? Math.round(hist.filter(Boolean).length / hist.length * 100) : 0;
                   return (
                     <div key={h.id} style={{ background: "rgba(255,255,255,0.02)", borderRadius: 22, padding: 20, border: "1px solid rgba(255,255,255,0.04)", animation: `slideIn .4s ease ${i * 0.05}s both` }}>
                       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
@@ -785,9 +1327,9 @@ export default function Dashboard({ user }: { user: User }) {
                         </div>
                         <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 13, fontWeight: 700, color: "#f59e0b" }}>{h.streak}d</span>
                       </div>
-                      {h.history.length > 0 && (
+                      {hist.length > 0 && (
                         <div style={{ display: "flex", gap: 3, alignItems: "end", marginBottom: 14 }}>
-                          {h.history.map((d, j) => (
+                          {hist.map((d, j) => (
                             <div key={j} style={{ flex: 1, height: d ? 28 : 8, borderRadius: 3, background: d ? "rgba(52,211,153,0.45)" : "rgba(239,68,68,0.12)" }} />
                           ))}
                         </div>
@@ -882,6 +1424,35 @@ export default function Dashboard({ user }: { user: User }) {
           </div>
         </div>
 
+        {/* Insurance toggle */}
+        <div onClick={() => { haptic(6); setNewH(p => ({ ...p, insured: !p.insured })); }} style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          padding: "14px 16px", borderRadius: 16, marginBottom: 16, cursor: "pointer",
+          background: newH.insured ? "rgba(245,158,11,0.08)" : "rgba(255,255,255,0.03)",
+          border: `1.5px solid ${newH.insured ? "rgba(245,158,11,0.3)" : "rgba(255,255,255,0.06)"}`,
+          transition: "all 0.2s",
+        }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <span style={{ fontSize: 20 }}>🛡️</span>
+            <div>
+              <p style={{ fontSize: 14, fontWeight: 600, color: newH.insured ? "#f59e0b" : "rgba(255,255,255,0.7)", marginBottom: 2 }}>Habit Insurance</p>
+              <p style={{ fontSize: 12, color: "rgba(255,255,255,0.3)" }}>1 free miss/month · one-time {fmt(insuranceFee(newH.stake))}</p>
+            </div>
+          </div>
+          {/* Toggle pill */}
+          <div style={{
+            width: 44, height: 26, borderRadius: 13, position: "relative",
+            background: newH.insured ? "#f59e0b" : "rgba(255,255,255,0.1)",
+            transition: "background 0.2s", flexShrink: 0,
+          }}>
+            <div style={{
+              position: "absolute", top: 3, left: newH.insured ? 21 : 3,
+              width: 20, height: 20, borderRadius: "50%", background: "#fff",
+              transition: "left 0.2s", boxShadow: "0 1px 4px rgba(0,0,0,0.3)",
+            }} />
+          </div>
+        </div>
+
         {addError && <p style={{ fontSize: 13, color: "#ef4444", marginBottom: 12, padding: "10px 14px", background: "rgba(239,68,68,0.08)", borderRadius: 10 }}>{addError}</p>}
         <button onClick={add} disabled={adding || !newH.name.trim()} style={{
           width: "100%", padding: 17, borderRadius: 16, border: "none",
@@ -905,7 +1476,7 @@ export default function Dashboard({ user }: { user: User }) {
 
         {/* Tappable avatar */}
         <div style={{ display: "flex", flexDirection: "column", alignItems: "center", marginBottom: 20, gap: 8 }}>
-          <div className="avatar-edit" onClick={() => { haptic(8); fileRef.current?.click(); }} style={{
+          <div className="avatar-edit" onClick={() => { if (avatarUploading) return; haptic(8); fileRef.current?.click(); }} style={{
             width: 80, height: 80, borderRadius: 40, cursor: "pointer", position: "relative",
             background: avatarUrl ? "transparent" : profileColor,
             display: "flex", alignItems: "center", justifyContent: "center",
@@ -1030,6 +1601,19 @@ export default function Dashboard({ user }: { user: User }) {
           {profileSaving ? "Saving..." : "Save Changes"}
         </button>
 
+        {/* Share Profile */}
+        <button onClick={shareProfile} style={{
+          width: "100%", padding: 14, borderRadius: 16, marginBottom: 12,
+          border: "1.5px solid rgba(255,255,255,0.1)",
+          background: profileLinkCopied ? "rgba(52,211,153,0.08)" : "rgba(255,255,255,0.04)",
+          color: profileLinkCopied ? "#34d399" : "rgba(255,255,255,0.7)",
+          fontSize: 15, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
+          display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+          transition: "all 0.2s",
+        }}>
+          {profileLinkCopied ? "✓ Link Copied!" : "🔗 Share My Profile"}
+        </button>
+
         <button onClick={signOut} style={{
           width: "100%", padding: 14, borderRadius: 16, border: "1px solid rgba(239,68,68,0.2)",
           background: "rgba(239,68,68,0.06)", color: "rgba(239,68,68,0.8)",
@@ -1040,34 +1624,258 @@ export default function Dashboard({ user }: { user: User }) {
       </Sheet>
 
       {/* ONBOARDING */}
-      <Sheet show={showOnboarding} onClose={() => {}}>
-        <div style={{ textAlign: "center", marginBottom: 24 }}>
-          <div style={{ fontSize: 40, marginBottom: 12 }}>👋</div>
-          <h2 style={{ fontSize: 22, fontWeight: 700, marginBottom: 6 }}>Welcome to BetOnMe</h2>
-          <p style={{ fontSize: 14, color: "rgba(255,255,255,0.4)" }}>Tell us a bit about yourself to get started</p>
-        </div>
-
-        <div style={{ marginBottom: 16 }}>
-          <label style={labelStyle}>Your Name</label>
-          <input value={profileName} onChange={e => setProfileName(e.target.value)}
-            placeholder="Your name" style={inputStyle} />
+      <Sheet show={showOnboarding} onClose={skipOnboarding}>
+        <div style={{ textAlign: "center", marginBottom: 28 }}>
+          <div style={{ fontSize: 48, marginBottom: 14 }}>💸</div>
+          <h2 style={{ fontSize: 24, fontWeight: 800, marginBottom: 8 }}>Welcome to BetOnMe</h2>
+          <p style={{ fontSize: 14, color: "rgba(255,255,255,0.4)", lineHeight: 1.5 }}>Stake real money on your habits.<br/>Win back every dollar you stick to them.</p>
         </div>
 
         <div style={{ marginBottom: 28 }}>
-          <label style={labelStyle}>Date of Birth</label>
-          <input type="date" value={profileBirth} onChange={e => setProfileBirth(e.target.value)}
-            style={{ ...inputStyle, colorScheme: "dark" }} />
-          <p style={{ fontSize: 12, color: "rgba(255,255,255,0.25)", marginTop: 6 }}>Required to participate in bets</p>
+          <label style={labelStyle}>What should we call you?</label>
+          <input value={profileName} onChange={e => setProfileName(e.target.value)}
+            placeholder="Your name (optional)" style={inputStyle}
+            onKeyDown={e => e.key === "Enter" && saveProfile()} />
         </div>
 
-        <button onClick={saveProfile} disabled={!profileBirth || profileSaving} style={{
+        <button onClick={saveProfile} disabled={profileSaving} style={{
           width: "100%", padding: 17, borderRadius: 16, border: "none",
-          background: profileBirth ? "linear-gradient(135deg, #34d399, #10b981)" : "rgba(255,255,255,0.05)",
-          color: profileBirth ? "#000" : "rgba(255,255,255,0.2)",
-          fontSize: 16, fontWeight: 700, cursor: profileBirth ? "pointer" : "default", fontFamily: "inherit",
+          background: "linear-gradient(135deg, #34d399, #10b981)",
+          color: "#000", fontSize: 16, fontWeight: 700, cursor: "pointer", fontFamily: "inherit",
         }}>
-          {profileSaving ? "Saving..." : "Get Started"}
+          {profileSaving ? "Starting..." : "Start Betting 💸"}
         </button>
+        <p onClick={skipOnboarding} style={{
+          textAlign: "center", marginTop: 16, fontSize: 13,
+          color: "rgba(255,255,255,0.2)", cursor: "pointer",
+        }}>Skip for now</p>
+      </Sheet>
+
+      {/* WALLET SHEET */}
+      <Sheet show={showWallet} onClose={() => setShowWallet(false)}>
+        {/* Header */}
+        <h2 style={{ fontSize: 22, fontWeight: 700, color: "#f5f5f7", marginBottom: 8 }}>Wallet</h2>
+
+        {/* Balance hero */}
+        <div style={{
+          textAlign: "center", padding: "28px 0 24px",
+          background: "linear-gradient(135deg, rgba(52,211,153,0.05), rgba(59,130,246,0.05))",
+          borderRadius: 22, border: "1px solid rgba(52,211,153,0.08)", marginBottom: 20,
+        }}>
+          <p style={{ fontSize: 12, fontWeight: 600, color: "rgba(255,255,255,0.3)", letterSpacing: 2, textTransform: "uppercase", marginBottom: 8 }}>Available Balance</p>
+          <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 44, fontWeight: 700, color: balance >= 0 ? "#34d399" : "#ef4444", letterSpacing: -1 }}>
+            {fmt(balance)}
+          </span>
+          {balance < 0 && (
+            <p style={{ fontSize: 12, color: "rgba(239,68,68,0.5)", marginTop: 8 }}>Balance is negative — please deposit funds</p>
+          )}
+        </div>
+
+        {/* Deposit / Withdraw tabs */}
+        <div style={{ display: "flex", background: "rgba(255,255,255,0.04)", borderRadius: 14, padding: 3, marginBottom: 20 }}>
+          {(["deposit", "withdraw"] as const).map(t => (
+            <button key={t} onClick={() => { setWalletTab(t); setDepositError(""); setWithdrawError(""); }} style={{
+              flex: 1, padding: "10px 0", border: "none", borderRadius: 11,
+              background: walletTab === t ? "rgba(255,255,255,0.07)" : "transparent",
+              color: walletTab === t ? "#f5f5f7" : "rgba(255,255,255,0.3)",
+              fontSize: 14, fontWeight: 600, cursor: "pointer", fontFamily: "inherit",
+              transition: "background 0.2s, color 0.2s",
+            }}>{t === "deposit" ? "Deposit" : "Withdraw"}</button>
+          ))}
+        </div>
+
+        {walletTab === "deposit" && (
+          <div style={{ marginBottom: 24 }}>
+            <p style={{ fontSize: 11, color: "rgba(255,255,255,0.25)", marginBottom: 12 }}>Send USDC on Base network to your in-app balance</p>
+            <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+              {[5, 10, 25, 50].map(amt => (
+                <button key={amt} onClick={() => setDepositAmount(String(amt))} style={{
+                  flex: 1, padding: "10px 0", borderRadius: 12, border: `1.5px solid ${depositAmount === String(amt) ? "#34d399" : "rgba(255,255,255,0.08)"}`,
+                  background: depositAmount === String(amt) ? "rgba(52,211,153,0.1)" : "rgba(255,255,255,0.03)",
+                  color: depositAmount === String(amt) ? "#34d399" : "rgba(255,255,255,0.5)",
+                  fontSize: 14, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", transition: "all 0.15s",
+                }}>${amt}</button>
+              ))}
+            </div>
+            <div style={{ display: "flex", gap: 8, marginBottom: depositError ? 8 : 0 }}>
+              <div style={{ flex: 1, display: "flex", alignItems: "center", background: "rgba(255,255,255,0.04)", borderRadius: 12, border: "1.5px solid rgba(255,255,255,0.08)", paddingLeft: 14 }}>
+                <span style={{ color: "rgba(255,255,255,0.3)", fontSize: 16, fontWeight: 600 }}>$</span>
+                <input
+                  type="number" min="1" step="1"
+                  value={depositAmount}
+                  onChange={e => setDepositAmount(e.target.value)}
+                  style={{ flex: 1, background: "none", border: "none", outline: "none", color: "#f5f5f7", fontSize: 16, fontWeight: 600, padding: "12px 8px", fontFamily: "'JetBrains Mono', monospace" }}
+                />
+              </div>
+              <button onClick={handleDeposit} disabled={depositLoading || !privyReady} style={{
+                padding: "12px 20px", borderRadius: 12, border: "none",
+                background: depositLoading ? "rgba(52,211,153,0.3)" : "linear-gradient(135deg, #34d399, #10b981)",
+                color: "#000", fontSize: 15, fontWeight: 700, cursor: depositLoading ? "default" : "pointer",
+                fontFamily: "inherit", minWidth: 100, transition: "all 0.2s",
+              }}>
+                {depositLoading ? (walletsRef.current.length === 0 ? "Setting up…" : "Sending…") : privyAuthed ? "Deposit" : "Connect Wallet"}
+              </button>
+            </div>
+            {depositError && <p style={{ fontSize: 12, color: "#ef4444", marginTop: 4 }}>{depositError}</p>}
+          </div>
+        )}
+
+        {walletTab === "withdraw" && (
+          <div style={{ marginBottom: 24 }}>
+            <p style={{ fontSize: 11, color: "rgba(255,255,255,0.25)", marginBottom: 12 }}>Withdraw USDC to any Base wallet. Min $1.</p>
+            {withdrawSuccess > 0 ? (
+              <div style={{
+                textAlign: "center", padding: "24px 0",
+                background: "rgba(52,211,153,0.06)", borderRadius: 16,
+                border: "1px solid rgba(52,211,153,0.15)",
+              }}>
+                <div style={{ fontSize: 36, marginBottom: 8 }}>✅</div>
+                <p style={{ fontSize: 16, fontWeight: 700, color: "#34d399" }}>{fmt(withdrawSuccess)} sent!</p>
+                <p style={{ fontSize: 12, color: "rgba(255,255,255,0.3)", marginTop: 4 }}>USDC is on its way to your wallet</p>
+              </div>
+            ) : (
+              <>
+                <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+                  {[5, 10, 25, 50].map(amt => (
+                    <button key={amt} onClick={() => setWithdrawAmount(String(amt))} style={{
+                      flex: 1, padding: "10px 0", borderRadius: 12,
+                      border: `1.5px solid ${withdrawAmount === String(amt) ? "#3b82f6" : "rgba(255,255,255,0.08)"}`,
+                      background: withdrawAmount === String(amt) ? "rgba(59,130,246,0.1)" : "rgba(255,255,255,0.03)",
+                      color: withdrawAmount === String(amt) ? "#3b82f6" : "rgba(255,255,255,0.5)",
+                      fontSize: 14, fontWeight: 700, cursor: "pointer", fontFamily: "inherit", transition: "all 0.15s",
+                    }}>${amt}</button>
+                  ))}
+                </div>
+                <div style={{ display: "flex", alignItems: "center", background: "rgba(255,255,255,0.04)", borderRadius: 12, border: "1.5px solid rgba(255,255,255,0.08)", paddingLeft: 14, marginBottom: 8 }}>
+                  <span style={{ color: "rgba(255,255,255,0.3)", fontSize: 16, fontWeight: 600 }}>$</span>
+                  <input
+                    type="number" min="1" step="1"
+                    value={withdrawAmount}
+                    onChange={e => setWithdrawAmount(e.target.value)}
+                    style={{ flex: 1, background: "none", border: "none", outline: "none", color: "#f5f5f7", fontSize: 16, fontWeight: 600, padding: "12px 8px", fontFamily: "'JetBrains Mono', monospace" }}
+                  />
+                </div>
+                <input
+                  type="text" placeholder="0x... wallet address"
+                  value={withdrawAddress}
+                  onChange={e => setWithdrawAddress(e.target.value)}
+                  style={{ ...inputStyle, marginBottom: 8, fontFamily: "'JetBrains Mono', monospace", fontSize: 13 }}
+                />
+                <button onClick={handleWithdraw} disabled={withdrawLoading || balance < 100} style={{
+                  width: "100%", padding: "14px 0", borderRadius: 14, border: "none",
+                  background: withdrawLoading ? "rgba(59,130,246,0.3)" : balance < 100 ? "rgba(255,255,255,0.05)" : "linear-gradient(135deg, #3b82f6, #6366f1)",
+                  color: balance < 100 ? "rgba(255,255,255,0.2)" : "#fff",
+                  fontSize: 15, fontWeight: 700, cursor: withdrawLoading || balance < 100 ? "default" : "pointer",
+                  fontFamily: "inherit", transition: "all 0.2s",
+                }}>
+                  {withdrawLoading ? "Sending…" : balance < 100 ? "No balance to withdraw" : `Withdraw ${fmt(Math.floor(parseFloat(withdrawAmount || "0") * 100))}`}
+                </button>
+                {withdrawError && <p style={{ fontSize: 12, color: "#ef4444", marginTop: 8 }}>{withdrawError}</p>}
+              </>
+            )}
+          </div>
+        )}
+
+        {/* Transaction history */}
+        <p style={{ fontSize: 12, fontWeight: 600, color: "rgba(255,255,255,0.3)", letterSpacing: 2, textTransform: "uppercase", marginBottom: 12 }}>History</p>
+
+        {txLoading ? (
+          <div style={{ textAlign: "center", padding: "32px 0", color: "rgba(255,255,255,0.2)", fontSize: 14 }}>Loading...</div>
+        ) : transactions.length === 0 ? (
+          <div style={{ textAlign: "center", padding: "32px 0", color: "rgba(255,255,255,0.15)", fontSize: 14 }}>
+            No transactions yet.<br/>Your deposits and penalties will appear here.
+          </div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {transactions.map((tx, i) => {
+              const isCredit = tx.amount > 0;
+              const icon = tx.type === "deposit" ? "💳" : tx.type === "penalty" ? "💸" : tx.type === "withdrawal" ? "⬆️" : tx.type === "refund" ? "↩️" : "💰";
+              const color = isCredit ? "#34d399" : "#ef4444";
+              const date = new Date(tx.created_at).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+              return (
+                <div key={tx.id} style={{
+                  display: "flex", alignItems: "center", justifyContent: "space-between",
+                  padding: "14px 16px",
+                  background: "rgba(255,255,255,0.02)", borderRadius: 14,
+                  border: "1px solid rgba(255,255,255,0.04)",
+                  animation: `txSlide 0.3s ease ${i * 0.04}s both`,
+                }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                    <div style={{
+                      width: 36, height: 36, borderRadius: 10, flexShrink: 0,
+                      background: isCredit ? "rgba(52,211,153,0.08)" : "rgba(239,68,68,0.08)",
+                      display: "flex", alignItems: "center", justifyContent: "center", fontSize: 17,
+                    }}>{icon}</div>
+                    <div>
+                      <p style={{ fontSize: 13, fontWeight: 600, color: "#f5f5f7", marginBottom: 2 }}>{tx.description || tx.type}</p>
+                      <p style={{ fontSize: 11, color: "rgba(255,255,255,0.25)" }}>{date}</p>
+                    </div>
+                  </div>
+                  <span style={{ fontFamily: "'JetBrains Mono', monospace", fontSize: 15, fontWeight: 700, color }}>
+                    {isCredit ? "+" : ""}{fmt(tx.amount)}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+      </Sheet>
+
+      {/* PRIVY LOGIN SHEET — custom bottom sheet instead of Privy modal */}
+      <Sheet show={showPrivyLogin} onClose={() => { setShowPrivyLogin(false); pendingDeposit.current = false; }}>
+        <div style={{ textAlign: "center", marginBottom: 24 }}>
+          <div style={{ fontSize: 36, marginBottom: 8 }}>🔐</div>
+          <h2 style={{ fontSize: 20, fontWeight: 700, color: "#f5f5f7", marginBottom: 6 }}>Connect Wallet</h2>
+          <p style={{ fontSize: 14, color: "rgba(255,255,255,0.4)" }}>
+            {privyLoginStep === "email" ? "Enter your email to create or connect a crypto wallet" : `Enter the 6-digit code sent to ${privyEmail}`}
+          </p>
+        </div>
+
+        {privyLoginStep === "email" ? (
+          <>
+            <input
+              type="email" placeholder="you@example.com"
+              value={privyEmail}
+              onChange={e => setPrivyEmail(e.target.value)}
+              onKeyDown={e => e.key === "Enter" && handleSendCode()}
+              autoFocus
+              style={{ ...inputStyle, marginBottom: 12 }}
+            />
+            <button onClick={handleSendCode} disabled={privyLoginLoading} style={{
+              width: "100%", padding: 16, borderRadius: 16, border: "none",
+              background: privyLoginLoading ? "rgba(52,211,153,0.3)" : "linear-gradient(135deg, #34d399, #10b981)",
+              color: "#000", fontSize: 16, fontWeight: 700, cursor: privyLoginLoading ? "default" : "pointer", fontFamily: "inherit",
+            }}>
+              {privyLoginLoading ? "Sending…" : "Send Code"}
+            </button>
+          </>
+        ) : (
+          <>
+            <input
+              type="text" inputMode="numeric" placeholder="123456"
+              value={privyCode}
+              onChange={e => setPrivyCode(e.target.value.replace(/\D/g, "").slice(0, 6))}
+              onKeyDown={e => e.key === "Enter" && handleVerifyCode()}
+              autoFocus
+              style={{ ...inputStyle, marginBottom: 12, textAlign: "center", fontSize: 24, letterSpacing: 8, fontFamily: "'JetBrains Mono', monospace" }}
+            />
+            <button onClick={handleVerifyCode} disabled={privyLoginLoading} style={{
+              width: "100%", padding: 16, borderRadius: 16, border: "none",
+              background: privyLoginLoading ? "rgba(52,211,153,0.3)" : "linear-gradient(135deg, #34d399, #10b981)",
+              color: "#000", fontSize: 16, fontWeight: 700, cursor: privyLoginLoading ? "default" : "pointer", fontFamily: "inherit", marginBottom: 12,
+            }}>
+              {privyLoginLoading ? "Verifying…" : "Verify & Continue"}
+            </button>
+            <button onClick={() => { setPrivyLoginStep("email"); setPrivyCode(""); setPrivyLoginError(""); }} style={{
+              width: "100%", padding: 12, borderRadius: 14, border: "none",
+              background: "transparent", color: "rgba(255,255,255,0.35)", fontSize: 14, cursor: "pointer", fontFamily: "inherit",
+            }}>
+              ← Change email
+            </button>
+          </>
+        )}
+
+        {privyLoginError && <p style={{ fontSize: 13, color: "#ef4444", marginTop: 8, textAlign: "center" }}>{privyLoginError}</p>}
       </Sheet>
     </div>
   );

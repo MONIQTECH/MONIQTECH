@@ -4,6 +4,10 @@
     {
       "path": "/api/push/cron",
       "schedule": "0 17 * * *"
+    },
+    {
+      "path": "/api/penalty/cron",
+      "schedule": "0 22 * * *"
     }
   ]
 }
